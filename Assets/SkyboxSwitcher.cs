@@ -1,58 +1,201 @@
+using System;
 using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Threading;
 using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.UI;
 using Oculus;
+using System.Net;
 
 public class SkyboxSwitcher : MonoBehaviour
 {
     public Material skyboxMaterial;
     public string folderName = "Content";
 
-    private List<Texture2D> textures = new List<Texture2D>();
+    private List<Texture2D> localTextures = new List<Texture2D>();
     private int currentIndex = 0;
     private bool comboTriggered = false;
 
+    private TcpClient client;
+    private NetworkStream netStream;
+    private Thread receiveThread;
+    private bool isRunning = false;
+
+    private byte[] networkThreadData = null;
+    private object lockObject = new object();
+
+    private Texture2D currentNetworkTexture = null;
+
+
+    // РњРµС‚РѕРґ РїСЂРѕРІРµСЂРєРё РґРѕСЃС‚СѓРїРЅРѕСЃС‚Рё РїРѕСЂС‚Р° РЅР° Р·Р°РґР°РЅРЅРѕРј IP
+    static bool IsPortOpen(string host, int port, int timeout)
+    {
+        try
+        {
+            using (TcpClient testClient = new TcpClient())
+            {
+                var asyncResult = testClient.BeginConnect(host, port, null, null);
+                bool success = asyncResult.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(timeout));
+                if (!success)
+                    return false;
+
+                testClient.EndConnect(asyncResult);
+                return true;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // РћРїСЂРµРґРµР»СЏРµРј СЃРѕР±СЃС‚РІРµРЅРЅС‹Р№ Р»РѕРєР°Р»СЊРЅС‹Р№ IP-Р°РґСЂРµСЃ, Р·Р°С‚РµРј РІС‹С‡РёСЃР»СЏРµРј РµРіРѕ РїСЂРµС„РёРєСЃ
+    string GetLocalIpPrefix()
+    {
+        try
+        {
+            // Р‘РµСЂС‘Рј РІСЃРµ IP Р°РґСЂРµСЃР° С‚РµРєСѓС‰РµР№ РјР°С€РёРЅС‹
+            var addresses = Dns.GetHostAddresses(Dns.GetHostName());
+            foreach (var addr in addresses)
+            {
+                // РС‰РµРј IPv4-Р°РґСЂРµСЃ, РЅРµ СЏРІР»СЏСЋС‰РёР№СЃСЏ loopback
+                if (addr.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(addr))
+                {
+                    // РќР°РїСЂРёРјРµСЂ, РµСЃР»Рё addr = 192.168.31.47,
+                    // СЂР°Р·РґРµР»РёРј РїРѕ С‚РѕС‡РєР°Рј Рё РІРѕР·СЊРјС‘Рј РїРµСЂРІС‹Рµ 3 РѕРєС‚РµС‚Р°.
+                    string[] parts = addr.ToString().Split('.');
+                    if (parts.Length == 4)
+                    {
+                        // 192.168.31.
+                        return parts[0] + "." + parts[1] + "." + parts[2] + ".";
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("РћС€РёР±РєР° РїСЂРё РїРѕР»СѓС‡РµРЅРёРё Р»РѕРєР°Р»СЊРЅРѕРіРѕ IP: " + e);
+        }
+
+        return ""; // РµСЃР»Рё РЅРµ СѓРґР°Р»РѕСЃСЊ РѕРїСЂРµРґРµР»РёС‚СЊ
+    }
+
+    // РЎРєР°РЅРёСЂСѓРµРј РІ РїРѕРґСЃРµС‚Рё (1..254), РёС‰РµРј РѕС‚РєСЂС‹С‚ Р»Рё РїРѕСЂС‚
+    string FindServerIp(int port, int timeoutMs)
+    {
+        string prefix = GetLocalIpPrefix();
+        if (string.IsNullOrEmpty(prefix))
+        {
+            Debug.LogWarning("РќРµ СѓРґР°Р»РѕСЃСЊ РѕРїСЂРµРґРµР»РёС‚СЊ РїСЂРµС„РёРєСЃ РґР»СЏ Р»РѕРєР°Р»СЊРЅРѕРіРѕ IP");
+            // РџРѕРїС‹С‚Р°РµРјСЃСЏ РїСЂРµРґРїРѕР»РѕР¶РёС‚СЊ 192.168.0. РІ РєСЂР°Р№РЅРµРј СЃР»СѓС‡Р°Рµ
+            prefix = "192.168.0.";
+        }
+
+        Debug.Log("РЎРєР°РЅРёСЂСѓРµРј СЃ РїСЂРµС„РёРєСЃРѕРј: " + prefix);
+        for (int i = 1; i < 255; i++)
+        {
+            string testIp = prefix + i;
+            if (IsPortOpen(testIp, port, timeoutMs))
+            {
+                Debug.Log("РќР°Р№РґРµРЅ СЃРµСЂРІРµСЂ: " + testIp + ":" + port);
+                return testIp;
+            }
+        }
+        Debug.LogWarning("РЎРµСЂРІРµСЂ РІ РїРѕРґСЃРµС‚Рё " + prefix + " РЅРµ РЅР°Р№РґРµРЅ");
+        return "";
+    }
+
+
     void Start()
     {
-        LoadTextures();
-        if (textures.Count > 0)
+        LoadLocalTextures();
+        if (localTextures.Count > 0)
         {
-            ApplyTexture(currentIndex);
+            ApplyTexture(localTextures[currentIndex]);
+        }
+
+        string host = "192.168.31.98";
+        // string subnet = "192.168.";
+        int timeout = 500;
+        int port = 63508;
+        // string host = FindServerIp(subnet, port, timeout);
+
+        Debug.Log("Starting connection");
+
+        try
+        {
+            client = new TcpClient();
+            client.Connect(host, port);
+            netStream = client.GetStream();
+            isRunning = true;
+
+            Debug.Log("Before receive");
+
+            // Р—Р°РїСѓСЃРєР°РµРј РїРѕС‚РѕРє РґР»СЏ РїРѕР»СѓС‡РµРЅРёСЏ РїР°РЅРѕСЂР°РјС‹
+            receiveThread = new Thread(ReceivePanorama);
+            receiveThread.Start();
+
+            Debug.Log("Connected to " + host + ":" + port);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("Connection failed: " + e);
         }
     }
 
     void Update()
     {
-        // Получаем текущее состояние клавиатуры из новой Input System
+        // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅпїЅ Input System
+        byte[] localCopy = null;
+        lock (lockObject)
+        {
+            if (networkThreadData != null)
+            {
+                localCopy = networkThreadData;
+                networkThreadData = null; // СЃР±СЂР°СЃС‹РІР°РµРј, С‡С‚РѕР±С‹ РЅРµ РѕР±СЂР°Р±Р°С‚С‹РІР°С‚СЊ РїРѕРІС‚РѕСЂРЅРѕ
+            }
+        }
+        if (localCopy != null)
+        {
+            // РЎРѕР·РґР°С‘Рј С‚РµРєСЃС‚СѓСЂСѓ С‚РѕР»СЊРєРѕ РІ РіР»Р°РІРЅРѕРј РїРѕС‚РѕРєРµ
+            Texture2D panoTexture = new Texture2D(2, 2, TextureFormat.RGB24, false);
+            panoTexture.LoadImage(localCopy);
+
+            currentNetworkTexture = panoTexture;
+            // РџСЂРёРјРµРЅСЏРµРј Рє Skybox
+            ApplyTexture(panoTexture);
+            Debug.Log("РџР°РЅРѕСЂР°РјР° РѕР±РЅРѕРІР»РµРЅР°!");
+        }
+
         var keyboard = Keyboard.current;
         if (keyboard != null)
         {
             // || keyboard.aKey.wasPressedThisFrame
             if (keyboard.leftArrowKey.wasPressedThisFrame)
             {
-                ChangeSkybox(-1);
+                ChangeLocalSkybox(-1);
             }
 
             // || keyboard.dKey.wasPressedThisFram
             if (keyboard.rightArrowKey.wasPressedThisFrame)
             {
-                ChangeSkybox(1);
+                ChangeLocalSkybox(1);
             }
 
-            // Переключение вперёд (кнопка A)
+            // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ (пїЅпїЅпїЅпїЅпїЅпїЅ A)
             if (OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch))
             {
-                ChangeSkybox(1);
+                ChangeLocalSkybox(1);
             }
 
-            // Переключение назад (кнопка B)
+            // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ (пїЅпїЅпїЅпїЅпїЅпїЅ B)
             if (OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.RTouch))
             {
-                ChangeSkybox(-1);
+                ChangeLocalSkybox(-1);
             }
 
-            // Проверка зажатой комбинации буквы и цифры:
+            // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅ:
             string letter = "";
             if (keyboard.aKey.isPressed) letter = "a";
             else if (keyboard.bKey.isPressed) letter = "b";
@@ -94,19 +237,19 @@ public class SkyboxSwitcher : MonoBehaviour
 
             if (!string.IsNullOrEmpty(letter) && !string.IsNullOrEmpty(digit))
             {
-                // Если комбинация не была уже обработана в текущем зажатии клавиш:
+                // пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ:
                 if (!comboTriggered)
                 {
-                    string targetName = letter + digit; // Например, "a1"
+                    string targetName = letter + digit; // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ, "a1"
                     bool found = false;
-                    for (int i = 0; i < textures.Count; i++)
+                    for (int i = 0; i < localTextures.Count; i++)
                     {
-                        // Приводим имя текстуры к нижнему регистру для корректного сравнения.
-                        if (textures[i].name.ToLower() == targetName)
+                        // пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ.
+                        if (localTextures[i].name.ToLower() == targetName)
                         {
                             currentIndex = i;
-                            ApplyTexture(currentIndex);
-                            Debug.Log("Смена Skybox на: " + targetName);
+                            ApplyTexture(localTextures[currentIndex]);
+                            Debug.Log("пїЅпїЅпїЅпїЅпїЅ Skybox пїЅпїЅ: " + targetName);
                             found = true;
                             break;
                         }
@@ -114,7 +257,7 @@ public class SkyboxSwitcher : MonoBehaviour
 
                     if (!found)
                     {
-                        Debug.LogWarning("Панорама с именем " + targetName + " не найдена!");
+                        Debug.LogWarning("пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ " + targetName + " пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ!");
                     }
                     comboTriggered = true;
                 }
@@ -122,46 +265,118 @@ public class SkyboxSwitcher : MonoBehaviour
 
             else
             {
-                // Если комбинация не зажата, сбрасываем флаг для следующего срабатывания
+                // пїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ, пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
                 comboTriggered = false;
             }
         }
     }
 
-        void LoadTextures()
+        private void OnDestroy()
+    {
+        isRunning = false;
+        if (receiveThread != null && receiveThread.IsAlive)
+        {
+            receiveThread.Join();
+        }
+        if (netStream != null) netStream.Close();
+        if (client != null) client.Close();
+    }
+
+        void LoadLocalTextures()
     {
         Texture2D[] loadedTextures = Resources.LoadAll<Texture2D>(folderName);
-        textures.AddRange(loadedTextures);
+        localTextures.AddRange(loadedTextures);
 
-        if (textures.Count == 0)
+        if (localTextures.Count == 0)
         {
-            Debug.LogError("Не найдено панорам в папке Resources/" + folderName);
+            Debug.LogError("пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅ Resources/" + folderName);
         }
     }
 
-    void ChangeSkybox(int direction)
+    void ChangeLocalSkybox(int direction)
     {
-        if (textures.Count == 0) return;
+        if (localTextures.Count == 0) return;
 
         currentIndex += direction;
 
-        if (currentIndex < 0) currentIndex = textures.Count - 1;
-        if (currentIndex >= textures.Count) currentIndex = 0;
+        if (currentIndex < 0) currentIndex = localTextures.Count - 1;
+        if (currentIndex >= localTextures.Count) currentIndex = 0;
 
-        ApplyTexture(currentIndex);
+        ApplyTexture(localTextures[currentIndex]);
     }
 
-    void ApplyTexture(int index)
+    void ApplyTexture(Texture2D tex)
     {
         if (skyboxMaterial != null)
         {
-            skyboxMaterial.SetTexture("_MainTex", textures[index]);
+            skyboxMaterial.SetTexture("_MainTex", tex);
             RenderSettings.skybox = skyboxMaterial;
-            Debug.Log("Смена Skybox: " + textures[index].name);
+            Debug.Log("пїЅпїЅпїЅпїЅпїЅ Skybox: " + tex.name);
         }
         else
         {
-            Debug.LogError("Skybox Material не установлен!");
+            Debug.LogError("Skybox Material пїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ!");
+        }
+    }
+
+     void ReceivePanorama()
+    {
+        try
+        {
+            // РЎС‡РёС‚Р°РµРј РїСЂРёРІРµС‚СЃС‚РІРµРЅРЅРѕРµ СЃРѕРѕР±С‰РµРЅРёРµ (РѕРїС†РёРѕРЅР°Р»СЊРЅРѕ)
+            // byte[] buffer = new byte[1024];
+            // int readCount = netStream.Read(buffer, 0, buffer.Length);
+            // string greeting = System.Text.Encoding.UTF8.GetString(buffer, 0, readCount);
+            Debug.Log("Server says: ");
+
+            while (isRunning)
+            {
+                // Р–РґС‘Рј 4 Р±Р°Р№С‚Р° РґР»РёРЅС‹
+                byte[] lengthBytes = new byte[4];
+                int received = 0;
+
+                Debug.Log("Before the length: ");
+
+                while (received < 4)
+                {
+                    int r = netStream.Read(lengthBytes, received, 4 - received);
+                    if (r <= 0) throw new Exception("Socket closed while reading length");
+                    received += r;
+                    Debug.Log("In the length: " + r + " bytes read");
+                }
+
+                Debug.Log("After the length: ");
+
+                int rawValue = BitConverter.ToInt32(lengthBytes, 0);
+                int dataSize = System.Net.IPAddress.NetworkToHostOrder(rawValue);
+                // int dataSize = 12449334;
+                if (dataSize <= 0) continue;
+
+                Debug.Log("Reading data: " + dataSize);
+
+                // Р§РёС‚Р°РµРј СЃС‚РѕР»СЊРєРѕ, СЃРєРѕР»СЊРєРѕ СЃРєР°Р·Р°РЅРѕ
+                byte[] data = new byte[dataSize];
+                int totalRead = 0;
+                while (totalRead < dataSize)
+                {
+                    int r = netStream.Read(data, totalRead, dataSize - totalRead);
+                    if (r <= 0) throw new Exception("Socket closed while reading data");
+                    totalRead += r;
+                    Debug.Log("Read chunk: " + r + " total: " + totalRead);
+                }
+
+                Debug.Log("We received panorama lol: ");
+
+                lock (lockObject)
+                {
+                    networkThreadData = data;
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("Receive thread error: " + e);
+            isRunning = false;
         }
     }
 }
