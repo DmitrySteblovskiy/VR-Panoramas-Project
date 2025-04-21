@@ -21,14 +21,93 @@ public class SkyboxSwitcher : MonoBehaviour
     private NetworkStream netStream;
     private Thread receiveThread;
     private bool isRunning = false;
+    private bool isConnecting = false;
+    private int reconnectTimeoutMs = 5000;
 
     private byte[] networkThreadData = null;
     private object lockObject = new object();
-
     private Texture2D currentNetworkTexture = null;
 
+    void Start()
+    {
+        LoadLocalTextures();
+        if (localTextures.Count > 0)
+        {
+            ApplyTexture(localTextures[currentIndex]);
+        }
+        // Запускаем соединение в отдельном потоке с ретраями
+        StartConnection();
+    }
 
-    // Метод проверки доступности порта на заданном IP
+    void StartConnection()
+    {
+        if (isConnecting) return;
+        isConnecting = true;
+        Thread connectThread = new Thread(ConnectionLoop);
+        connectThread.IsBackground = true;
+        connectThread.Start();
+    }
+
+    void ConnectionLoop()
+    {
+        int timeout = 50;
+        int port = 63508;
+        while (true)
+        {
+            string host = FindServerIp(port, timeout);
+            if (string.IsNullOrEmpty(host))
+            {
+                Debug.LogWarning("Не удалось найти сервер, повторная попытка через 5 секунд.");
+                Thread.Sleep(reconnectTimeoutMs);
+                continue;
+            }
+
+            Debug.Log("Starting connection");
+            bool connected = false;
+            try
+            {
+                client = new TcpClient();
+                client.Connect(host, port);
+                netStream = client.GetStream();
+                isRunning = true;
+                connected = true;
+
+                Debug.Log("Before receive");
+
+                // Запускаем поток для получения панорамы
+                receiveThread = new Thread(ReceivePanorama);
+                receiveThread.IsBackground = true;
+                receiveThread.Start();
+
+                Debug.Log("Connected to " + host + ":" + port);
+
+                // Ждём завершения потока чтения (он завершится при ошибке/разрыве)
+                receiveThread.Join();
+            }
+            catch (Exception e)
+            {
+                Debug.LogError("Connection failed: " + e);
+            }
+
+            isRunning = false;
+            if (netStream != null)
+            {
+                try { netStream.Close(); } catch { }
+                netStream = null;
+            }
+            if (client != null)
+            {
+                try { client.Close(); } catch { }
+                client = null;
+            }
+            if (connected)
+                Debug.LogWarning("Потеря соединения, переподключение через 5 секунд...");
+
+            Thread.Sleep(reconnectTimeoutMs);
+        }
+    }
+
+    // Метод проверки открытого порта и поиска сервера (остальное — без изменений)
     static bool IsPortOpen(string host, int port, int timeout)
     {
         try
@@ -49,25 +128,18 @@ public class SkyboxSwitcher : MonoBehaviour
             return false;
         }
     }
-
-    // Определяем собственный локальный IP-адрес, затем вычисляем его префикс
     string GetLocalIpPrefix()
     {
         try
         {
-            // Берём все IP адреса текущей машины
             var addresses = Dns.GetHostAddresses(Dns.GetHostName());
             foreach (var addr in addresses)
             {
-                // Ищем IPv4-адрес, не являющийся loopback
                 if (addr.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(addr))
                 {
-                    // Например, если addr = 192.168.31.47,
-                    // разделим по точкам и возьмём первые 3 октета.
                     string[] parts = addr.ToString().Split('.');
                     if (parts.Length == 4)
                     {
-                        // 192.168.31.
                         return parts[0] + "." + parts[1] + "." + parts[2] + ".";
                     }
                 }
@@ -77,21 +149,16 @@ public class SkyboxSwitcher : MonoBehaviour
         {
             Debug.LogError("Ошибка при получении локального IP: " + e);
         }
-
-        return ""; // если не удалось определить
+        return "";
     }
-
-    // Сканируем в подсети (1..254), ищем открыт ли порт
     string FindServerIp(int port, int timeoutMs)
     {
         string prefix = GetLocalIpPrefix();
         if (string.IsNullOrEmpty(prefix))
         {
             Debug.LogWarning("Не удалось определить префикс для локального IP");
-            // Попытаемся предположить 192.168.0. в крайнем случае
             prefix = "192.168.0.";
         }
-
         Debug.Log("Сканируем с префиксом: " + prefix);
         for (int i = 1; i < 255; i++)
         {
@@ -106,64 +173,22 @@ public class SkyboxSwitcher : MonoBehaviour
         return "";
     }
 
-
-    void Start()
-    {
-        LoadLocalTextures();
-        if (localTextures.Count > 0)
-        {
-            ApplyTexture(localTextures[currentIndex]);
-        }
-
-        string host = "192.168.31.98";
-        // string subnet = "192.168.";
-        int timeout = 500;
-        int port = 63508;
-        // string host = FindServerIp(subnet, port, timeout);
-
-        Debug.Log("Starting connection");
-
-        try
-        {
-            client = new TcpClient();
-            client.Connect(host, port);
-            netStream = client.GetStream();
-            isRunning = true;
-
-            Debug.Log("Before receive");
-
-            // Запускаем поток для получения панорамы
-            receiveThread = new Thread(ReceivePanorama);
-            receiveThread.Start();
-
-            Debug.Log("Connected to " + host + ":" + port);
-        }
-        catch (Exception e)
-        {
-            Debug.LogError("Connection failed: " + e);
-        }
-    }
-
     void Update()
     {
-        // �������� ������� ��������� ���������� �� ����� Input System
         byte[] localCopy = null;
         lock (lockObject)
         {
             if (networkThreadData != null)
             {
                 localCopy = networkThreadData;
-                networkThreadData = null; // сбрасываем, чтобы не обрабатывать повторно
+                networkThreadData = null;
             }
         }
         if (localCopy != null)
         {
-            // Создаём текстуру только в главном потоке
             Texture2D panoTexture = new Texture2D(2, 2, TextureFormat.RGB24, false);
             panoTexture.LoadImage(localCopy);
-
             currentNetworkTexture = panoTexture;
-            // Применяем к Skybox
             ApplyTexture(panoTexture);
             Debug.Log("Панорама обновлена!");
         }
@@ -171,31 +196,23 @@ public class SkyboxSwitcher : MonoBehaviour
         var keyboard = Keyboard.current;
         if (keyboard != null)
         {
-            // || keyboard.aKey.wasPressedThisFrame
             if (keyboard.leftArrowKey.wasPressedThisFrame)
             {
                 ChangeLocalSkybox(-1);
             }
-
-            // || keyboard.dKey.wasPressedThisFram
             if (keyboard.rightArrowKey.wasPressedThisFrame)
             {
                 ChangeLocalSkybox(1);
             }
-
-            // ������������ ����� (������ A)
             if (OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch))
             {
                 ChangeLocalSkybox(1);
             }
-
-            // ������������ ����� (������ B)
             if (OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.RTouch))
             {
                 ChangeLocalSkybox(-1);
             }
 
-            // �������� ������� ���������� ����� � �����:
             string letter = "";
             if (keyboard.aKey.isPressed) letter = "a";
             else if (keyboard.bKey.isPressed) letter = "b";
@@ -237,41 +254,36 @@ public class SkyboxSwitcher : MonoBehaviour
 
             if (!string.IsNullOrEmpty(letter) && !string.IsNullOrEmpty(digit))
             {
-                // ���� ���������� �� ���� ��� ���������� � ������� ������� ������:
                 if (!comboTriggered)
                 {
-                    string targetName = letter + digit; // ��������, "a1"
+                    string targetName = letter + digit;
                     bool found = false;
                     for (int i = 0; i < localTextures.Count; i++)
                     {
-                        // �������� ��� �������� � ������� �������� ��� ����������� ���������.
                         if (localTextures[i].name.ToLower() == targetName)
                         {
                             currentIndex = i;
                             ApplyTexture(localTextures[currentIndex]);
-                            Debug.Log("����� Skybox ��: " + targetName);
+                            Debug.Log("Переключено на Skybox: " + targetName);
                             found = true;
                             break;
                         }
                     }
-
                     if (!found)
                     {
-                        Debug.LogWarning("�������� � ������ " + targetName + " �� �������!");
+                        Debug.LogWarning("Skybox с именем " + targetName + " не найден!");
                     }
                     comboTriggered = true;
                 }
             }
-
             else
             {
-                // ���� ���������� �� ������, ���������� ���� ��� ���������� ������������
                 comboTriggered = false;
             }
         }
     }
 
-        private void OnDestroy()
+    private void OnDestroy()
     {
         isRunning = false;
         if (receiveThread != null && receiveThread.IsAlive)
@@ -282,14 +294,14 @@ public class SkyboxSwitcher : MonoBehaviour
         if (client != null) client.Close();
     }
 
-        void LoadLocalTextures()
+    void LoadLocalTextures()
     {
         Texture2D[] loadedTextures = Resources.LoadAll<Texture2D>(folderName);
         localTextures.AddRange(loadedTextures);
 
         if (localTextures.Count == 0)
         {
-            Debug.LogError("�� ������� ������� � ����� Resources/" + folderName);
+            Debug.LogError("Нет текстур в папке Resources/" + folderName);
         }
     }
 
@@ -311,32 +323,24 @@ public class SkyboxSwitcher : MonoBehaviour
         {
             skyboxMaterial.SetTexture("_MainTex", tex);
             RenderSettings.skybox = skyboxMaterial;
-            Debug.Log("����� Skybox: " + tex.name);
+            Debug.Log("Skybox: " + tex.name);
         }
         else
         {
-            Debug.LogError("Skybox Material �� ����������!");
+            Debug.LogError("Skybox Material не назначен!");
         }
     }
 
-     void ReceivePanorama()
+    void ReceivePanorama()
     {
         try
         {
-            // Считаем приветственное сообщение (опционально)
-            // byte[] buffer = new byte[1024];
-            // int readCount = netStream.Read(buffer, 0, buffer.Length);
-            // string greeting = System.Text.Encoding.UTF8.GetString(buffer, 0, readCount);
             Debug.Log("Server says: ");
-
             while (isRunning)
             {
-                // Ждём 4 байта длины
                 byte[] lengthBytes = new byte[4];
                 int received = 0;
-
                 Debug.Log("Before the length: ");
-
                 while (received < 4)
                 {
                     int r = netStream.Read(lengthBytes, received, 4 - received);
@@ -346,15 +350,11 @@ public class SkyboxSwitcher : MonoBehaviour
                 }
 
                 Debug.Log("After the length: ");
-
                 int rawValue = BitConverter.ToInt32(lengthBytes, 0);
                 int dataSize = System.Net.IPAddress.NetworkToHostOrder(rawValue);
-                // int dataSize = 12449334;
                 if (dataSize <= 0) continue;
 
                 Debug.Log("Reading data: " + dataSize);
-
-                // Читаем столько, сколько сказано
                 byte[] data = new byte[dataSize];
                 int totalRead = 0;
                 while (totalRead < dataSize)
@@ -365,8 +365,7 @@ public class SkyboxSwitcher : MonoBehaviour
                     Debug.Log("Read chunk: " + r + " total: " + totalRead);
                 }
 
-                Debug.Log("We received panorama lol: ");
-
+                Debug.Log("We received panorama!");
                 lock (lockObject)
                 {
                     networkThreadData = data;
