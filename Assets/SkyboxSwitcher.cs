@@ -12,12 +12,12 @@ using System.Text;
 
 public class SkyboxSwitcher : MonoBehaviour
 {
-    
+    [Header("Scene refs")]
     public Material skyboxMaterial;
     public string folderName = "Content";
     public TextMeshProUGUI connectionStatusText;
 
-    
+    [Header("Networking")]
     public int crmPort = 63508;
     private const string WS_PATH = "/panoramas";
     private const int scanTimeoutMs = 50;
@@ -31,7 +31,7 @@ public class SkyboxSwitcher : MonoBehaviour
     private Thread connectThread;
 
     private readonly object imgLock = new object();
-    private byte incomingImage;
+    private byte[] incomingImage;
     private string incomingName;                 // имя панорамы для логов
 
     private string cacheFilePath;   // будет заполнено в Start
@@ -40,11 +40,29 @@ public class SkyboxSwitcher : MonoBehaviour
     private Texture2D _activeSkyTex;  // поле для хранения текущего skybox-текста
 
 
+    private async Task SendStatusToCrm(string msg)
+    {
+        try
+        {
+            if (ws != null && ws.State == WebSocketState.Open)
+            {
+                var bytes = Encoding.UTF8.GetBytes(msg);
+                await ws.SendAsync(new ArraySegment<byte>(bytes),
+                                   WebSocketMessageType.Text,
+                                   true, CancellationToken.None);
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"unity → не удалось отправить статус на CRM: {e.Message}");
+        }
+    }
+
 
     private void Start()
     {
         //LoadLocalTextures();
-        //if (localTextures.Count > 0) ApplyTexture(localTextures);
+        //if (localTextures.Count > 0) ApplyTexture(localTextures[currentIndex]);
 
         cacheFilePath = Path.Combine(Application.persistentDataPath, "current_ip.txt");
         Debug.Log($"cache → файл будет храниться по пути: {cacheFilePath}");
@@ -55,9 +73,7 @@ public class SkyboxSwitcher : MonoBehaviour
 
     private void Update()
     {
-        byte img = null;
-        string name = null;
-
+        byte[] img = null; string name = null;
         lock (imgLock)
         {
             if (incomingImage != null)
@@ -68,41 +84,30 @@ public class SkyboxSwitcher : MonoBehaviour
                 incomingName = null;
             }
         }
-
         if (img == null) return;
 
         var tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
-        bool ok = tex.LoadImage(img);
-        if (!ok)
+        if (!tex.LoadImage(img))
         {
-            Debug.LogError("unity → Texture2D.LoadImage() returned false");
+            Debug.LogError($"unity → LoadImage false: {name}");
+            _ = SendStatusToCrm($"ERR|DECODE|{name}");
             return;
         }
 
-        tex.name = name;
-        ApplyTexture(tex);
-        Debug.Log($"unity → panorama \"{name}\" applied to skybox");
-
-        // асинхронно шлём ACK не блокируя главный поток
-        _ = Task.Run(async () =>
+        try
         {
-            try
-            {
-                if (ws != null && ws.State == WebSocketState.Open)
-                {
-                    var bytes = Encoding.UTF8.GetBytes(name ?? string.Empty);
-                    await ws.SendAsync(new ArraySegment<byte>(bytes),
-                                       WebSocketMessageType.Text,
-                                       true,
-                                       CancellationToken.None);
-                    Debug.Log($"unity → ACK отправлен: \"{name}\"");
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"unity → ошибка отправки ACK: {e.Message}");
-            }
-        });
+            ApplyTexture(tex);
+            Debug.Log($"unity → panorama \"{name}\" applied");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"unity → APPLY exception: {ex.Message}");
+            _ = SendStatusToCrm($"ERR|APPLY|{name}|{ex.Message}");
+            Destroy(tex);
+            return;
+        }
+
+        _ = SendStatusToCrm($"ACK|{name}");
     }
 
     private void OnDestroy()
@@ -144,7 +149,7 @@ public class SkyboxSwitcher : MonoBehaviour
 
             using (ws = new ClientWebSocket())
             {
-                ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(10);
+                ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(10); // отвечает на ping
                 cts = new CancellationTokenSource();
                 try
                 {
@@ -153,8 +158,8 @@ public class SkyboxSwitcher : MonoBehaviour
                     if (ws.State == WebSocketState.Open)
                     {
                         Debug.Log("ws → подключено!");
-                        SaveIpToCache(host);
-                        ReceiveLoop(ws, cts.Token).Wait();
+                        SaveIpToCache(host);                    //  кэшируем
+                        ReceiveLoop(ws, cts.Token).Wait();      // работа до разрыва жепы
                     }
                 }
                 catch (Exception e)
@@ -163,13 +168,13 @@ public class SkyboxSwitcher : MonoBehaviour
                 }
             }
 
-            Thread.Sleep(reconnectTimeoutMs);
+            Thread.Sleep(reconnectTimeoutMs); // пауза перед повтором
         }
     }
 
     private async Task ReceiveLoop(ClientWebSocket socket, CancellationToken token)
     {
-        var buffer = new ArraySegment<byte>(new byte);
+        var buffer = new ArraySegment<byte>(new byte[128 * 1024]);
         int msgIdx = 0;
 
         while (socket.State == WebSocketState.Open && !token.IsCancellationRequested)
@@ -200,10 +205,11 @@ public class SkyboxSwitcher : MonoBehaviour
                 continue;
             }
 
-            int nameLen = (data << 24) |
-                           (data << 16) |
-                           (data << 8) |
-                           (data);         // big-endian int
+            /* ---- разбор пакета ---------------------------------------------- */
+            int nameLen = (data[0] << 24) |
+                           (data[1] << 16) |
+                           (data[2] << 8) |
+                           (data[3]);         // big-endian int
 
             if (nameLen < 0 || 4 + nameLen > data.Length)
             {
@@ -221,7 +227,7 @@ public class SkyboxSwitcher : MonoBehaviour
                 continue;
             }
 
-            var imgBytes = new byte;
+            var imgBytes = new byte[imgBytesLn];
             Buffer.BlockCopy(data, imgOffset, imgBytes, 0, imgBytesLn);
 
             Debug.Log($"unity → frame {msgIdx - 1}: name=\"{panoName}\", bytes={imgBytesLn}");
@@ -229,14 +235,14 @@ public class SkyboxSwitcher : MonoBehaviour
             lock (imgLock)
             {
                 incomingImage = imgBytes;
-                incomingName = panoName;
+                incomingName = panoName;   // для срм
             }
         }
     }
 
     private void SaveIpToCache(string ip)
     {
-        if (string.IsNullOrEmpty(cacheFilePath)) return;
+        if (string.IsNullOrEmpty(cacheFilePath)) return; // подстраховка
         try
         {
             File.WriteAllText(cacheFilePath, ip);
@@ -285,7 +291,7 @@ public class SkyboxSwitcher : MonoBehaviour
             if (addr.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(addr))
             {
                 var p = addr.ToString().Split('.');
-                return $"{p}.{p}.{p}.";
+                return $"{p[0]}.{p[1]}.{p[2]}.";
             }
         }
         return string.Empty;
