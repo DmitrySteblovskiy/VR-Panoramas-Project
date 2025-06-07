@@ -1,381 +1,332 @@
 using System;
 using System.Collections.Generic;
-using System.Net.Sockets;
-using System.Threading;
-using UnityEngine;
-using UnityEngine.InputSystem;
-using UnityEngine.UI;
-using Oculus;
+using System.IO;
 using System.Net;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Threading;
+using System.Threading.Tasks;
+using TMPro;
+using UnityEngine;
+using System.Text;
 
 public class SkyboxSwitcher : MonoBehaviour
 {
+    
     public Material skyboxMaterial;
     public string folderName = "Content";
+    public TextMeshProUGUI connectionStatusText;
 
-    private List<Texture2D> localTextures = new List<Texture2D>();
-    private int currentIndex = 0;
-    private bool comboTriggered = false;
+    
+    public int crmPort = 63508;
+    private const string WS_PATH = "/panoramas";
+    private const int scanTimeoutMs = 50;
+    private const int reconnectTimeoutMs = 5000;
 
-    private TcpClient client;
-    private NetworkStream netStream;
-    private Thread receiveThread;
-    private bool isRunning = false;
-    private bool isConnecting = false;
-    private int reconnectTimeoutMs = 5000;
+    private readonly List<Texture2D> localTextures = new List<Texture2D>();
+    private int currentIndex;
 
-    private byte[] networkThreadData = null;
-    private object lockObject = new object();
-    private Texture2D currentNetworkTexture = null;
+    private ClientWebSocket ws;
+    private CancellationTokenSource cts;
+    private Thread connectThread;
 
-    void Start()
+    private readonly object imgLock = new object();
+    private byte incomingImage;
+    private string incomingName;                 // имя панорамы для логов
+
+    private string cacheFilePath;   // будет заполнено в Start
+    private readonly object sendLock = new object();     // синхронизация отправок
+                                                        
+    private Texture2D _activeSkyTex;  // поле для хранения текущего skybox-текста
+
+
+
+    private void Start()
     {
-        LoadLocalTextures();
-        if (localTextures.Count > 0)
-        {
-            ApplyTexture(localTextures[currentIndex]);
-        }
-        // Запускаем соединение в отдельном потоке с ретраями
-        StartConnection();
-    }
+        //LoadLocalTextures();
+        //if (localTextures.Count > 0) ApplyTexture(localTextures);
 
-    void StartConnection()
-    {
-        if (isConnecting) return;
-        isConnecting = true;
-        Thread connectThread = new Thread(ConnectionLoop);
-        connectThread.IsBackground = true;
+        cacheFilePath = Path.Combine(Application.persistentDataPath, "current_ip.txt");
+        Debug.Log($"cache → файл будет храниться по пути: {cacheFilePath}");
+
+        connectThread = new Thread(ConnectionLoop) { IsBackground = true };
         connectThread.Start();
     }
 
-    void ConnectionLoop()
+    private void Update()
     {
-        int timeout = 50;
-        int port = 63508;
-        while (true)
-        {
-            string host = FindServerIp(port, timeout);
-            if (string.IsNullOrEmpty(host))
-            {
-                Debug.LogWarning("Не удалось найти сервер, повторная попытка через 5 секунд.");
-                Thread.Sleep(reconnectTimeoutMs);
-                continue;
-            }
+        byte img = null;
+        string name = null;
 
-            Debug.Log("Starting connection");
-            bool connected = false;
+        lock (imgLock)
+        {
+            if (incomingImage != null)
+            {
+                img = incomingImage;
+                name = incomingName;
+                incomingImage = null;
+                incomingName = null;
+            }
+        }
+
+        if (img == null) return;
+
+        var tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
+        bool ok = tex.LoadImage(img);
+        if (!ok)
+        {
+            Debug.LogError("unity → Texture2D.LoadImage() returned false");
+            return;
+        }
+
+        tex.name = name;
+        ApplyTexture(tex);
+        Debug.Log($"unity → panorama \"{name}\" applied to skybox");
+
+        // асинхронно шлём ACK не блокируя главный поток
+        _ = Task.Run(async () =>
+        {
             try
             {
-                client = new TcpClient();
-                client.Connect(host, port);
-                netStream = client.GetStream();
-                isRunning = true;
-                connected = true;
-
-                Debug.Log("Before receive");
-
-                // Запускаем поток для получения панорамы
-                receiveThread = new Thread(ReceivePanorama);
-                receiveThread.IsBackground = true;
-                receiveThread.Start();
-
-                Debug.Log("Connected to " + host + ":" + port);
-
-                // Ждём завершения потока чтения (он завершится при ошибке/разрыве)
-                receiveThread.Join();
+                if (ws != null && ws.State == WebSocketState.Open)
+                {
+                    var bytes = Encoding.UTF8.GetBytes(name ?? string.Empty);
+                    await ws.SendAsync(new ArraySegment<byte>(bytes),
+                                       WebSocketMessageType.Text,
+                                       true,
+                                       CancellationToken.None);
+                    Debug.Log($"unity → ACK отправлен: \"{name}\"");
+                }
             }
             catch (Exception e)
             {
-                Debug.LogError("Connection failed: " + e);
+                Debug.LogWarning($"unity → ошибка отправки ACK: {e.Message}");
+            }
+        });
+    }
+
+    private void OnDestroy()
+    {
+        cts?.Cancel();
+        ws?.Abort();
+        connectThread?.Join();
+    }
+
+    private void ConnectionLoop()
+    {
+        while (true)
+        {
+            string host = LoadIpFromCache();
+            if (!string.IsNullOrEmpty(host))
+            {
+                Debug.Log($"cache → пробуем IP из cache: {host}");
+                if (!IsPortOpen(host, crmPort, scanTimeoutMs))
+                {
+                    Debug.Log("cache → IP недоступен, запускаем сканирование");
+                    host = string.Empty;
+                }
             }
 
-            isRunning = false;
-            if (netStream != null)
+            if (string.IsNullOrEmpty(host))
             {
-                try { netStream.Close(); } catch { }
-                netStream = null;
+                host = FindServerIp(crmPort, scanTimeoutMs);
+                if (string.IsNullOrEmpty(host))
+                {
+                    Debug.LogWarning("CRM не найден, повтор через 5 сек.");
+                    Thread.Sleep(reconnectTimeoutMs);
+                    continue;
+                }
+                Debug.Log($"scan → найден CRM: {host}");
             }
-            if (client != null)
+
+            var uri = new Uri($"ws://{host}:{crmPort}{WS_PATH}");
+            Debug.Log($"ws → попытка подключения: {uri}");
+
+            using (ws = new ClientWebSocket())
             {
-                try { client.Close(); } catch { }
-                client = null;
+                ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(10);
+                cts = new CancellationTokenSource();
+                try
+                {
+                    ws.ConnectAsync(uri, cts.Token).Wait(cts.Token);
+
+                    if (ws.State == WebSocketState.Open)
+                    {
+                        Debug.Log("ws → подключено!");
+                        SaveIpToCache(host);
+                        ReceiveLoop(ws, cts.Token).Wait();
+                    }
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"ws → error: {e}");
+                }
             }
-            if (connected)
-                Debug.LogWarning("Потеря соединения, переподключение через 5 секунд...");
 
             Thread.Sleep(reconnectTimeoutMs);
         }
     }
 
-    // Метод проверки открытого порта и поиска сервера (остальное — без изменений)
-    static bool IsPortOpen(string host, int port, int timeout)
+    private async Task ReceiveLoop(ClientWebSocket socket, CancellationToken token)
     {
-        try
-        {
-            using (TcpClient testClient = new TcpClient())
-            {
-                var asyncResult = testClient.BeginConnect(host, port, null, null);
-                bool success = asyncResult.AsyncWaitHandle.WaitOne(TimeSpan.FromMilliseconds(timeout));
-                if (!success)
-                    return false;
+        var buffer = new ArraySegment<byte>(new byte);
+        int msgIdx = 0;
 
-                testClient.EndConnect(asyncResult);
-                return true;
+        while (socket.State == WebSocketState.Open && !token.IsCancellationRequested)
+        {
+            using var ms = new MemoryStream();
+            WebSocketReceiveResult result;
+
+            Debug.Log($"unity → awaiting frame #{msgIdx}");
+            do
+            {
+                result = await socket.ReceiveAsync(buffer, token);
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    await socket.CloseAsync(WebSocketCloseStatus.NormalClosure,
+                                             "Closed by client", token);
+                    return;
+                }
+                ms.Write(buffer.Array, 0, result.Count);
+                Debug.Log($"unity → chunk {result.Count} / fin={result.EndOfMessage}");
+            } while (!result.EndOfMessage);
+
+            var data = ms.ToArray();
+            msgIdx++;
+
+            if (data.Length < 4)
+            {
+                Debug.LogWarning("unity → получено меньше 4-х байт, игнор.");
+                continue;
+            }
+
+            int nameLen = (data << 24) |
+                           (data << 16) |
+                           (data << 8) |
+                           (data);         // big-endian int
+
+            if (nameLen < 0 || 4 + nameLen > data.Length)
+            {
+                Debug.LogWarning($"unity → странная длина имени: {nameLen}");
+                continue;
+            }
+
+            string panoName = Encoding.UTF8.GetString(data, 4, nameLen);
+            int imgOffset = 4 + nameLen;
+            int imgBytesLn = data.Length - imgOffset;
+
+            if (imgBytesLn <= 0)
+            {
+                Debug.LogWarning("unity → в пакете нет байт картинки.");
+                continue;
+            }
+
+            var imgBytes = new byte;
+            Buffer.BlockCopy(data, imgOffset, imgBytes, 0, imgBytesLn);
+
+            Debug.Log($"unity → frame {msgIdx - 1}: name=\"{panoName}\", bytes={imgBytesLn}");
+
+            lock (imgLock)
+            {
+                incomingImage = imgBytes;
+                incomingName = panoName;
             }
         }
-        catch
-        {
-            return false;
-        }
     }
-    string GetLocalIpPrefix()
+
+    private void SaveIpToCache(string ip)
     {
+        if (string.IsNullOrEmpty(cacheFilePath)) return;
         try
         {
-            var addresses = Dns.GetHostAddresses(Dns.GetHostName());
-            foreach (var addr in addresses)
+            File.WriteAllText(cacheFilePath, ip);
+            Debug.Log($"cache → IP сохранён: {ip}");
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"cache → ошибка записи: {e.Message}");
+        }
+    }
+
+    private string LoadIpFromCache()
+    {
+        if (string.IsNullOrEmpty(cacheFilePath)) return string.Empty;
+        try
+        {
+            if (File.Exists(cacheFilePath))
             {
-                if (addr.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(addr))
-                {
-                    string[] parts = addr.ToString().Split('.');
-                    if (parts.Length == 4)
-                    {
-                        return parts[0] + "." + parts[1] + "." + parts[2] + ".";
-                    }
-                }
+                string ip = File.ReadAllText(cacheFilePath).Trim();
+                Debug.Log($"cache → из файла получен IP: {ip}");
+                return ip;
             }
         }
         catch (Exception e)
         {
-            Debug.LogError("Ошибка при получении локального IP: " + e);
+            Debug.LogWarning($"cache → ошибка чтения: {e.Message}");
         }
-        return "";
+        return string.Empty;
     }
-    string FindServerIp(int port, int timeoutMs)
+
+    private static bool IsPortOpen(string host, int port, int timeoutMs)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            var ar = client.BeginConnect(host, port, null, null);
+            return ar.AsyncWaitHandle.WaitOne(timeoutMs) && client.Connected;
+        }
+        catch { return false; }
+    }
+
+    private static string GetLocalIpPrefix()
+    {
+        foreach (var addr in Dns.GetHostAddresses(Dns.GetHostName()))
+        {
+            if (addr.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(addr))
+            {
+                var p = addr.ToString().Split('.');
+                return $"{p}.{p}.{p}.";
+            }
+        }
+        return string.Empty;
+    }
+
+    private static string FindServerIp(int port, int timeoutMs)
     {
         string prefix = GetLocalIpPrefix();
-        if (string.IsNullOrEmpty(prefix))
-        {
-            Debug.LogWarning("Не удалось определить префикс для локального IP");
-            prefix = "192.168.0.";
-        }
-        Debug.Log("Сканируем с префиксом: " + prefix);
+        if (string.IsNullOrEmpty(prefix)) prefix = "192.168.0.";
+
         for (int i = 1; i < 255; i++)
         {
-            string testIp = prefix + i;
-            if (IsPortOpen(testIp, port, timeoutMs))
-            {
-                Debug.Log("Найден сервер: " + testIp + ":" + port);
-                return testIp;
-            }
+            var ip = prefix + i;
+            if (IsPortOpen(ip, port, timeoutMs)) return ip;
         }
-        Debug.LogWarning("Сервер в подсети " + prefix + " не найден");
-        return "";
+        return string.Empty;
     }
 
-    void Update()
+    private void LoadLocalTextures()
     {
-        byte[] localCopy = null;
-        lock (lockObject)
-        {
-            if (networkThreadData != null)
-            {
-                localCopy = networkThreadData;
-                networkThreadData = null;
-            }
-        }
-        if (localCopy != null)
-        {
-            Texture2D panoTexture = new Texture2D(2, 2, TextureFormat.RGB24, false);
-            panoTexture.LoadImage(localCopy);
-            currentNetworkTexture = panoTexture;
-            ApplyTexture(panoTexture);
-            Debug.Log("Панорама обновлена!");
-        }
-
-        var keyboard = Keyboard.current;
-        if (keyboard != null)
-        {
-            if (keyboard.leftArrowKey.wasPressedThisFrame)
-            {
-                ChangeLocalSkybox(-1);
-            }
-            if (keyboard.rightArrowKey.wasPressedThisFrame)
-            {
-                ChangeLocalSkybox(1);
-            }
-            if (OVRInput.GetDown(OVRInput.Button.One, OVRInput.Controller.RTouch))
-            {
-                ChangeLocalSkybox(1);
-            }
-            if (OVRInput.GetDown(OVRInput.Button.Two, OVRInput.Controller.RTouch))
-            {
-                ChangeLocalSkybox(-1);
-            }
-
-            string letter = "";
-            if (keyboard.aKey.isPressed) letter = "a";
-            else if (keyboard.bKey.isPressed) letter = "b";
-            else if (keyboard.cKey.isPressed) letter = "c";
-            else if (keyboard.dKey.isPressed) letter = "d";
-            else if (keyboard.eKey.isPressed) letter = "e";
-            else if (keyboard.fKey.isPressed) letter = "f";
-            else if (keyboard.gKey.isPressed) letter = "g";
-            else if (keyboard.hKey.isPressed) letter = "h";
-            else if (keyboard.iKey.isPressed) letter = "i";
-            else if (keyboard.jKey.isPressed) letter = "j";
-            else if (keyboard.kKey.isPressed) letter = "k";
-            else if (keyboard.lKey.isPressed) letter = "l";
-            else if (keyboard.mKey.isPressed) letter = "m";
-            else if (keyboard.nKey.isPressed) letter = "n";
-            else if (keyboard.oKey.isPressed) letter = "o";
-            else if (keyboard.pKey.isPressed) letter = "p";
-            else if (keyboard.qKey.isPressed) letter = "q";
-            else if (keyboard.rKey.isPressed) letter = "r";
-            else if (keyboard.sKey.isPressed) letter = "s";
-            else if (keyboard.tKey.isPressed) letter = "t";
-            else if (keyboard.uKey.isPressed) letter = "u";
-            else if (keyboard.vKey.isPressed) letter = "v";
-            else if (keyboard.wKey.isPressed) letter = "w";
-            else if (keyboard.xKey.isPressed) letter = "x";
-            else if (keyboard.zKey.isPressed) letter = "z";
-
-            string digit = "";
-            if (keyboard.digit0Key.isPressed) digit = "0";
-            else if (keyboard.digit1Key.isPressed) digit = "1";
-            else if (keyboard.digit2Key.isPressed) digit = "2";
-            else if (keyboard.digit3Key.isPressed) digit = "3";
-            else if (keyboard.digit4Key.isPressed) digit = "4";
-            else if (keyboard.digit5Key.isPressed) digit = "5";
-            else if (keyboard.digit6Key.isPressed) digit = "6";
-            else if (keyboard.digit7Key.isPressed) digit = "7";
-            else if (keyboard.digit8Key.isPressed) digit = "8";
-            else if (keyboard.digit9Key.isPressed) digit = "9";
-
-            if (!string.IsNullOrEmpty(letter) && !string.IsNullOrEmpty(digit))
-            {
-                if (!comboTriggered)
-                {
-                    string targetName = letter + digit;
-                    bool found = false;
-                    for (int i = 0; i < localTextures.Count; i++)
-                    {
-                        if (localTextures[i].name.ToLower() == targetName)
-                        {
-                            currentIndex = i;
-                            ApplyTexture(localTextures[currentIndex]);
-                            Debug.Log("Переключено на Skybox: " + targetName);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found)
-                    {
-                        Debug.LogWarning("Skybox с именем " + targetName + " не найден!");
-                    }
-                    comboTriggered = true;
-                }
-            }
-            else
-            {
-                comboTriggered = false;
-            }
-        }
-    }
-
-    private void OnDestroy()
-    {
-        isRunning = false;
-        if (receiveThread != null && receiveThread.IsAlive)
-        {
-            receiveThread.Join();
-        }
-        if (netStream != null) netStream.Close();
-        if (client != null) client.Close();
-    }
-
-    void LoadLocalTextures()
-    {
-        Texture2D[] loadedTextures = Resources.LoadAll<Texture2D>(folderName);
-        localTextures.AddRange(loadedTextures);
-
+        localTextures.AddRange(Resources.LoadAll<Texture2D>(folderName));
         if (localTextures.Count == 0)
-        {
-            Debug.LogError("Нет текстур в папке Resources/" + folderName);
-        }
+            Debug.LogWarning($"Нет текстур в Resources/{folderName}");
     }
 
-    void ChangeLocalSkybox(int direction)
+    private void ApplyTexture(Texture2D tex)
     {
-        if (localTextures.Count == 0) return;
+        if (_activeSkyTex != null)
+            Destroy(_activeSkyTex);            // освобождаем старый GPU-объект
 
-        currentIndex += direction;
+        _activeSkyTex = tex;
 
-        if (currentIndex < 0) currentIndex = localTextures.Count - 1;
-        if (currentIndex >= localTextures.Count) currentIndex = 0;
-
-        ApplyTexture(localTextures[currentIndex]);
-    }
-
-    void ApplyTexture(Texture2D tex)
-    {
-        if (skyboxMaterial != null)
+        if (skyboxMaterial == null)
         {
-            skyboxMaterial.SetTexture("_MainTex", tex);
-            RenderSettings.skybox = skyboxMaterial;
-            Debug.Log("Skybox: " + tex.name);
+            Debug.LogError("Skybox material not set");
+            return;
         }
-        else
-        {
-            Debug.LogError("Skybox Material не назначен!");
-        }
-    }
+        skyboxMaterial.SetTexture("_MainTex", tex);
+        RenderSettings.skybox = skyboxMaterial;
 
-    void ReceivePanorama()
-    {
-        try
-        {
-            Debug.Log("Server says: ");
-            while (isRunning)
-            {
-                byte[] lengthBytes = new byte[4];
-                int received = 0;
-                Debug.Log("Before the length: ");
-                while (received < 4)
-                {
-                    int r = netStream.Read(lengthBytes, received, 4 - received);
-                    if (r <= 0) throw new Exception("Socket closed while reading length");
-                    received += r;
-                    Debug.Log("In the length: " + r + " bytes read");
-                }
-
-                Debug.Log("After the length: ");
-                int rawValue = BitConverter.ToInt32(lengthBytes, 0);
-                int dataSize = System.Net.IPAddress.NetworkToHostOrder(rawValue);
-                if (dataSize <= 0) continue;
-
-                Debug.Log("Reading data: " + dataSize);
-                byte[] data = new byte[dataSize];
-                int totalRead = 0;
-                while (totalRead < dataSize)
-                {
-                    int r = netStream.Read(data, totalRead, dataSize - totalRead);
-                    if (r <= 0) throw new Exception("Socket closed while reading data");
-                    totalRead += r;
-                    Debug.Log("Read chunk: " + r + " total: " + totalRead);
-                }
-
-                Debug.Log("We received panorama!");
-                lock (lockObject)
-                {
-                    networkThreadData = data;
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            Debug.LogError("Receive thread error: " + e);
-            isRunning = false;
-        }
+        // убираем копию из системной памяти
+        tex.Apply(updateMipmaps: false, makeNoLongerReadable: true);
     }
 }
